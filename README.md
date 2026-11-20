@@ -46,13 +46,15 @@ app/
     http_probe.py   逐跳 HTTP/1.1 探测引擎、跳转规范化与上限
     config.py       环境变量配置（启动时校验）
     main.py         FastAPI 应用（/api/v1/probe、/docs）
-  dns_service/      本地可切换解析的 DNS（UDP/53 + HTTP 控制面 profile 热切换）
+  dns_service/      本地可切换解析的 DNS（UDP/53 + HTTP 控制面：场景热切换、
+                    修订号与自定义 A 记录整组发布、状态持久化）
   targets/          演示目标（HTTP/8080、HTTPS/8443，含各类跳转与访问记录）
   certinit/         生成演示 CA、服务器证书、合并 CA bundle
-dns-profiles/       DNS 场景：allowed / swapped / mixed / loop
+dns-profiles/       DNS 内置场景：allowed / swapped / mixed / loop
 compose.yaml        一键启动的完整演示环境
-tests/              57 个测试（策略、DNS 协议、TLS、跳转、并发、API 全链路）
-scripts/demo.sh     演示脚本
+tests/              测试（策略、DNS 协议、TLS、跳转、并发、API、DNS 控制面全链路）
+scripts/demo.sh     探测流程演示脚本
+scripts/dns-verify.sh  DNS 自定义场景发布与应答核验脚本
 ```
 
 ## 快速开始
@@ -61,6 +63,8 @@ scripts/demo.sh     演示脚本
 docker compose up -d --build
 # 探测 API（仅绑定本机回环）
 open http://127.0.0.1:8000/docs
+# DNS 控制 API（仅绑定本机回环）
+curl http://127.0.0.1:8053/profiles
 ```
 
 演示环境网络拓扑（全部 IPv4，静态地址）：
@@ -131,14 +135,23 @@ open http://127.0.0.1:8000/docs
 
 辅助接口：`GET /api/v1/policy`（当前白名单与超时配置）、`GET /healthz`。
 
-## 演示场景与 DNS profile 切换
+## 演示场景、修订号与自定义场景发布
 
-本地 DNS 的解析数据按 profile 组织，可热切换：
+本地 DNS 的解析数据按 profile 组织，可热切换，并由一个**全局修订号
+（revision）**保护并发修改：
+
+- `GET /profiles` 返回当前修订号、启用场景与全部场景数据；
+- `POST /profiles/switch` 切换内置场景，每次成功修订号 +1；
+- `POST /profiles/publish` 整组发布自定义 A 记录，每次成功修订号 +1；
+- 两个接口共用同一个修订号，请求携带的修订号过期即返回 `409` 冲突；
+- 任何校验或保存失败都不改变内存状态与落盘状态，UDP 继续按原场景应答。
+
+### 切换内置场景
 
 ```bash
-# 查看当前 profile 与全部解析数据
+# 查看当前 revision、active 与全部解析数据
 curl http://127.0.0.1:8053/profiles
-# 切换
+# 切换（可选携带 revision 做乐观锁；不带 revision 不做冲突检查）
 curl -X POST http://127.0.0.1:8053/profiles/switch \
   -H 'Content-Type: application/json' -d '{"profile":"swapped"}'
 ```
@@ -149,6 +162,59 @@ curl -X POST http://127.0.0.1:8053/profiles/switch \
 | `swapped` | 同名域名从允许地址换到禁止地址（**检查后换址 / DNS rebinding**） |
 | `mixed` | 一次应答同时含允许与禁止地址，验证“全部获准才连接” |
 | `loop` | 连环 307 跳转，验证 3 次跳转上限 |
+
+### 发布自定义场景（供应商回调迁移）
+
+`POST /profiles/publish` 接收当前修订号和一组**完整** A 记录，整组替换
+自定义记录并唯一启用 `custom` 场景。发布规则：
+
+- 域名只接受 `demo.test` 下的**具体子域名**（拒绝裸 `demo.test`、通配符
+  `*.demo.test`、空标签与其他后缀，大小写不敏感）；
+- 地址必须全部是 `172.31.10.0/24` 内的 IPv4 地址（拒绝 IPv6 与其他网段）；
+- `records` 必须是非空对象，每个域名对应非空 A 记录数组；
+- 成功后 `active=custom`，内置场景仍保留并可随时切回，自定义记录在切换
+  期间不丢失；再发布即整组替换（上一组中未出现的域名立即 NXDOMAIN）。
+
+```bash
+# 1) 取当前修订号
+REV=$(curl -sS http://127.0.0.1:8053/profiles | jq .revision)
+
+# 2) 整组发布（修订号、完整 A 记录）
+curl -sS -X POST http://127.0.0.1:8053/profiles/publish \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -n --argjson rev "$REV" '{revision:$rev, records:{
+    "webhook-a.demo.test": ["172.31.10.21"],
+    "webhook-b.demo.test": ["172.31.10.22", "172.31.10.23"]
+  }}')"
+# 200 -> {"revision": <rev+1>, "active": "custom", "profiles": {...}}
+
+# 3) 用旧修订号再发一次 -> 409，响应带 current_revision，场景不变
+#    非法域名/越界地址/非法 JSON -> 400，修订号不推进
+```
+
+### 持久化与重启恢复
+
+修订号、当前启用场景与最后一次成功保存的自定义记录以原子写入方式持久化
+到 `dns-state` 卷（容器内 `/tmp/dns-state/state.json`，临时文件 + rename）。
+容器重启后自动恢复三者；只有成功提交才落盘，校验/冲突失败不会破坏已保存
+状态。旧版纯文本状态文件在首次启动时自动迁移为 JSON 格式。
+
+### DNS 应答核验示例
+
+控制 API 与 UDP 解析器都只发布在宿主机回环地址：
+
+| 入口 | 宿主机地址 |
+| --- | --- |
+| 控制 API（HTTP） | `http://127.0.0.1:8053` |
+| DNS 解析器（UDP） | `127.0.0.1:5353`（容器内 53） |
+
+```bash
+# 有 dig 时
+dig @127.0.0.1 -p 5353 webhook-a.demo.test A +short
+# 无 dig 时运行自带核验脚本（仅需 bash/curl/jq/python3 标准库，含完整
+# 发布→冲突→校验拒绝→UDP 应答→场景切换→状态确认流程）
+./scripts/dns-verify.sh
+```
 
 ## 配置项（探测服务环境变量）
 
@@ -170,9 +236,11 @@ pip install -r requirements.txt pytest pytest-asyncio
 pytest -q
 ```
 
-57 个测试覆盖：CIDR/URL 策略、DNS 编解码与压缩指针环路、全链路探测、
+97 个测试覆盖：CIDR/URL 策略、DNS 编解码与压缩指针环路、全链路探测、
 混合解析整体拒绝、检查后换址、跳转上限/跳禁区/非 HTTP 协议、HTTPS 证书
-主机名校验与不受信证书拒绝、慢探测并发非阻塞、429 保护、API 层。
+主机名校验与不受信证书拒绝、慢探测并发非阻塞、429 保护、API 层，以及
+DNS 控制面的修订号推进/乐观锁冲突、自定义记录整组发布与校验、失败原子性、
+UDP 应答随场景变化、重启恢复与旧状态文件迁移。
 
 ## 设计边界与说明
 
